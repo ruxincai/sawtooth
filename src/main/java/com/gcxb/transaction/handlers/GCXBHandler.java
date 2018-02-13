@@ -1,35 +1,56 @@
-package com.gcxb.transaction;
+/*
+ * Copyright 2018 Toronto Tiger Inc.
+ * ALL RIGHTS RESERVED.
+ */
 
+package com.gcxb.transaction.handlers;
+
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.io.UnsupportedEncodingException;
+import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Map;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.gcxb.transaction.CBORUtils;
+import com.gcxb.transaction.TransactionType;
+import com.gcxb.transaction.model.GCXBMetaInfo;
+import com.gcxb.transaction.model.TransactionMetaInfo;
+import com.google.protobuf.ByteString;
 import org.apache.commons.lang3.StringUtils;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 import sawtooth.sdk.processor.State;
 import sawtooth.sdk.processor.TransactionHandler;
 import sawtooth.sdk.processor.Utils;
 import sawtooth.sdk.processor.exceptions.InternalError;
 import sawtooth.sdk.processor.exceptions.InvalidTransactionException;
 import sawtooth.sdk.protobuf.TpProcessRequest;
-import sawtooth.sdk.protobuf.TransactionHeader;
 
 public class GCXBHandler implements TransactionHandler {
 
-/**
- * Transaction Family Name.
- */
+/** Transaction Family Name. */
 private static final String FAMILY_NAME = "gcxb";
-/**
- * Transaction Family Version.
- */
+/** Transaction Family Version. */
 private static final String VERSION = "1.0.0";
-/**
- * The first 6 chars of hashing version of family name as GCXB namespace.
- */
+public static final String UTF_8 = "UTF-8";
+/** The first 6 chars of hashing version of family name as GCXB namespace. */
 private String namespace;
+/** Jackson object mapper to read/write cbor object. */
+private ObjectMapper objectMapper = new ObjectMapper();
+
+public GCXBHandler() {
+	try {
+		namespace = Utils.hash512(transactionFamilyName().getBytes(UTF_8)).substring(0, 6);
+	}
+	catch (UnsupportedEncodingException usee) {
+		namespace = StringUtils.EMPTY;
+	}
+}
 
 @Override
 public String transactionFamilyName() {
@@ -65,34 +86,75 @@ public void apply(TpProcessRequest tpProcessRequest, State state)
 	// the least should include: Create, Update, Delete
 	//Check the request to process accordingly.
 	GCXBMetaInfo metaInfo = (GCXBMetaInfo) getTransactionMetaInfo(tpProcessRequest);
-	TransactionHeader header = tpProcessRequest.getHeader();
 
-	switch (metaInfo.getTransactionType()) {
-		case EXCHANGE:
-			//process exchange transaction.
-			//TODO: validate the transaction???
-			String buyerAddress = metaInfo.getBuyerAddress();
-			String stateEntry = state.getState(Collections.singletonList(buyerAddress))
-					.get(buyerAddress).toStringUtf8();
+	try {
+		Collection<String> addresses = Collections.emptyList();
+		switch (metaInfo.getTransactionType()) {
+			case EXCHANGE:
+				//process exchange transaction.
+				//TODO: validate the transaction???
+				String address = getAddress(TransactionType.EXCHANGE.name());
 
-			//state.setState(header.getSignerPublicKey())
-			break;
-		case OTHER:
-			break;
+				Map<String, ByteString> possibleAddressValues = state.getState(
+						Collections.singletonList(address));
+				byte[] stateValueRep = possibleAddressValues.get(address).toByteArray();
+				Map<String, ?> stateValue;
+				if (stateValueRep.length > 0) {
+
+					//noinspection unchecked
+					stateValue = (Map<String, ?>) decodeState(stateValueRep, objectMapper,
+							GCXBMetaInfo.class);
+					if (stateValue.containsKey(address)) {
+						throw new InvalidTransactionException(
+								"Address is already in state, Address: " + address + " Value: " +
+										stateValue.get(address).toString());
+					}
+				}
+				addresses = state.setState(Collections.singletonList(
+						encodeState(address, objectMapper, metaInfo)));
+				break;
+			case OTHER:
+				return;
+		}
+		if (addresses.isEmpty()) {
+			throw new InternalError("State error!");
+		}
 	}
-
+	catch (IOException ioe) {
+		throw new InternalError("IOException " + ioe.toString());
+	}
 }
 
 /**
  * Helper function to generate new card address.
  */
-private String getBuyerAddress(@NotNull String buyerName) throws InternalError {
+private String getAddress(@NotNull String transactionType) throws InternalError {
 	try {
-		return namespace + Utils.hash512(buyerName.getBytes("UTF-8")).substring(0, 64);
+		return namespace + Utils.hash512(transactionType.getBytes("UTF-8")).substring(0, 64);
 	}
 	catch (UnsupportedEncodingException e) {
 		throw new InternalError("Internal Error: " + e.toString());
 	}
+}
+
+/**
+ * Helper function to decode State retrieved from the address.
+ */
+@NotNull
+private static <T> T decodeState(@NotNull byte[] bytes, @NotNull ObjectMapper objectMapper,
+		@NotNull Class<T> classType) throws IOException {
+	return objectMapper.readValue(CBORUtils.cborParser(bytes), classType);
+}
+
+/**
+ * Helper function to encode State written to the address.
+ */
+@NotNull
+private static <T> Map.Entry<String, ByteString> encodeState(@NotNull String address,
+		@NotNull ObjectMapper objectMapper, @Nullable T value) throws IOException {
+	ByteArrayOutputStream boas = new ByteArrayOutputStream();
+	objectMapper.writeValue(CBORUtils.cborGenerator(boas), value);
+	return new AbstractMap.SimpleEntry<>(address, ByteString.copyFrom(boas.toByteArray()));
 }
 
 /**
@@ -118,7 +180,8 @@ private static TransactionMetaInfo getTransactionMetaInfo(
 	String buyerAddress = infoArray[1];
 	String sellerAddress = infoArray[2];
 	String cardType = infoArray[3];
-	String amountStr = infoArray[4];
+	String cardId = infoArray[4];
+	String amountStr = infoArray[5];
 
 	if (StringUtils.isEmpty(transactionType)) {
 		throw new InvalidTransactionException(
@@ -133,6 +196,9 @@ private static TransactionMetaInfo getTransactionMetaInfo(
 	if (StringUtils.isEmpty(cardType)) {
 		throw new InvalidTransactionException("Missing required payload field - \"cardType\"");
 	}
+	if (StringUtils.isEmpty(cardId)) {
+		throw new InvalidTransactionException("Missing required payload field - \"cardId\"");
+	}
 	if (StringUtils.isEmpty(amountStr)) {
 		throw new InvalidTransactionException("Missing required payload field - \"amount\"");
 	}
@@ -144,40 +210,8 @@ private static TransactionMetaInfo getTransactionMetaInfo(
 		throw new InvalidTransactionException("Failed to parse \"amount\" object");
 	}
 
-	return new GCXBHandler.GCXBMetaInfo(TransactionType.valueOf(transactionType), buyerAddress,
-			sellerAddress, cardType, amount);
+	return new GCXBMetaInfo(TransactionType.valueOf(transactionType), buyerAddress,
+			sellerAddress, cardType, cardId, amount);
 }
 
-private static class GCXBMetaInfo extends TransactionMetaInfo {
-
-	private String buyerAddress;
-	private String sellerAddress;
-	private String cardType;
-	private double amount;
-
-	public GCXBMetaInfo(@NotNull TransactionType transactionType, @NotNull String buyerAddress,
-			@NotNull String sellerAddress, String cardType, double amount) {
-		super(transactionType);
-		this.buyerAddress = buyerAddress;
-		this.sellerAddress = sellerAddress;
-		this.cardType = cardType;
-		this.amount = amount;
-	}
-
-	public String getBuyerAddress() {
-		return buyerAddress;
-	}
-
-	public String getSellerAddress() {
-		return sellerAddress;
-	}
-
-	public String getCardType() {
-		return cardType;
-	}
-
-	public double getAmount() {
-		return amount;
-	}
-}
 }
